@@ -1,0 +1,18 @@
+{
+  "name": "whatsapp-monitor",
+  "version": "1.0.0",
+  "description": "Shadow Agent — WhatsApp monitor for Jarrah",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.23.0",
+    "qrcode": "^1.5.3",
+    "axios": "^1.6.0",
+    "@anthropic-ai/sdk": "^0.34.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
