@@ -24,11 +24,12 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(`
         <html>
+          <head><meta http-equiv="refresh" content="15"></head>
           <body style="text-align:center;font-family:sans-serif;padding:40px">
             <h1>Scan this QR code with WhatsApp</h1>
             <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
             <img src="${qrImage}" style="width:300px;height:300px" />
-            <p>Refresh this page if the QR code expires</p>
+            <p style="color:grey;font-size:14px">This page refreshes automatically every 15 seconds</p>
           </body>
         </html>
       `);
