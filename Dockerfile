@@ -14,11 +14,8 @@ RUN npm install --omit=dev
 # Copy app
 COPY index.js ./
 
-# Create persistent data directory
-RUN mkdir -p /data/wwebjs_auth && chown -R pptruser:pptruser /data
-
-# Switch back to non-root
-USER pptruser
+# Create persistent data directory (app runs as root so volume mounts are writable)
+RUN mkdir -p /data/wwebjs_auth
 
 EXPOSE 3000
 
