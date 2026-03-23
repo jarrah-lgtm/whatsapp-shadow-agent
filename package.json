@@ -10,7 +10,7 @@
     "whatsapp-web.js": "^1.23.0",
     "qrcode": "^1.5.3",
     "axios": "^1.6.0",
-    "@anthropic-ai/sdk": "^0.34.0"
+    "@anthropic-ai/sdk": "^0.80.0"
   },
   "engines": {
     "node": ">=18"
