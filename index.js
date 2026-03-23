@@ -3,6 +3,9 @@ const qrcode = require('qrcode');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -40,6 +43,22 @@ const server = http.createServer(async (req, res) => {
   } else if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', connected: isReady }));
+  } else if (req.url === '/upload-session' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        const zipPath = '/tmp/session.tar.gz';
+        fs.writeFileSync(zipPath, Buffer.from(body, 'base64'));
+        execSync(`mkdir -p /data/wwebjs_auth && cd /data/wwebjs_auth && tar -xzf ${zipPath}`);
+        fs.unlinkSync(zipPath);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, message: 'Session uploaded. Restart the service now.' }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
   } else {
     res.writeHead(302, { Location: '/qr' });
     res.end();
