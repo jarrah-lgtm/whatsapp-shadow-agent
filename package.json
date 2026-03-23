@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.23.0",
+    "whatsapp-web.js": "^1.34.6",
     "qrcode": "^1.5.3",
     "axios": "^1.6.0",
     "@anthropic-ai/sdk": "^0.80.0"
