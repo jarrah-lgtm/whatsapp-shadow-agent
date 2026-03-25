@@ -190,5 +190,14 @@ async function sendTelegram(message) {
   }
 }
 
+// Clear stale WhatsApp web cache so linking always works after WA updates
+const cacheDirs = ['/app/.wwebjs_cache', '/data/.wwebjs_cache', '.wwebjs_cache'];
+for (const dir of cacheDirs) {
+  if (fs.existsSync(dir)) {
+    console.log(`Clearing stale cache: ${dir}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log('Starting WhatsApp Shadow Agent...');
 client.initialize();

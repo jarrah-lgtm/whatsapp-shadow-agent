@@ -1,4 +1,4 @@
-FROM ghcr.io/puppeteer/puppeteer:22
+FROM ghcr.io/puppeteer/puppeteer:latest
 
 # Switch to root to install deps
 USER root
