@@ -1,21 +1,13 @@
-FROM ghcr.io/puppeteer/puppeteer:latest
-
-# Switch to root to install deps
-USER root
+FROM node:20-slim
 
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
-
-# Install dependencies
 RUN npm install --omit=dev
 
-# Copy app
 COPY index.js ./
 
-# Create persistent data directory (app runs as root so volume mounts are writable)
-RUN mkdir -p /data/wwebjs_auth
+RUN mkdir -p /data/baileys_auth
 
 EXPOSE 3000
 
