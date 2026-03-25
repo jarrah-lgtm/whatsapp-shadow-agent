@@ -13,18 +13,29 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AUTH_DIR = '/data/baileys_auth';
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-const logger = pino({ level: 'silent' });
+
+// Capture logs so we can show them on /logs
+const recentLogs = [];
+function log(msg) {
+  const entry = `[${new Date().toISOString()}] ${msg}`;
+  console.log(entry);
+  recentLogs.push(entry);
+  if (recentLogs.length > 100) recentLogs.shift();
+}
+
+// Use warn level so we can see Baileys connection errors
+const logger = pino({ level: 'warn' });
 
 let qrCodeData = null;
 let isReady = false;
 let sock = null;
 
-// Simple HTTP server to serve QR code for scanning
+// Simple HTTP server
 const server = http.createServer(async (req, res) => {
   if (req.url === '/qr') {
     if (isReady) {
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<h1>✅ WhatsApp Connected!</h1><p>Shadow Agent is running.</p>');
+      res.end('<h1>WhatsApp Connected!</h1><p>Shadow Agent is running.</p>');
     } else if (qrCodeData) {
       const qrImage = await qrcode.toDataURL(qrCodeData);
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -33,7 +44,7 @@ const server = http.createServer(async (req, res) => {
           <head><meta http-equiv="refresh" content="15"></head>
           <body style="text-align:center;font-family:sans-serif;padding:40px">
             <h1>Scan this QR code with WhatsApp</h1>
-            <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
+            <p>Open WhatsApp > Settings > Linked Devices > Link a Device</p>
             <img src="${qrImage}" style="width:300px;height:300px" />
             <p style="color:grey;font-size:14px">This page refreshes automatically every 15 seconds</p>
           </body>
@@ -45,7 +56,7 @@ const server = http.createServer(async (req, res) => {
         <html>
           <head><meta http-equiv="refresh" content="5"></head>
           <body style="text-align:center;font-family:sans-serif;padding:40px">
-            <h1>⏳ Starting up...</h1><p>Please wait, refreshing automatically...</p>
+            <h1>Starting up...</h1><p>Please wait, refreshing automatically...</p>
           </body>
         </html>
       `);
@@ -53,15 +64,18 @@ const server = http.createServer(async (req, res) => {
   } else if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', connected: isReady }));
-  } else if (req.url === '/reset' && req.method === 'POST') {
-    // Emergency reset — clears session and restarts
+  } else if (req.url === '/logs') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(recentLogs.join('\n') || 'No logs yet');
+  } else if (req.url === '/reset') {
+    // Clear session and restart
     try {
       if (fs.existsSync(AUTH_DIR)) {
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, message: 'Session cleared. Restarting...' }));
-      process.exit(0); // Railway will auto-restart
+      setTimeout(() => process.exit(0), 500);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -73,70 +87,78 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000, () => {
-  console.log(`QR server running on port ${process.env.PORT || 3000}`);
+  log(`QR server running on port ${process.env.PORT || 3000}`);
 });
 
 // WhatsApp connection using Baileys
 async function startWhatsApp() {
-  // Ensure auth directory exists
+  // Clear any old auth that might be corrupted
+  if (fs.existsSync(AUTH_DIR)) {
+    const files = fs.readdirSync(AUTH_DIR);
+    log(`Auth dir has ${files.length} files`);
+  }
+
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  console.log(`Using WA version: ${version.join('.')}`);
+  log(`Using WA version: ${version.join('.')}`);
 
   sock = makeWASocket({
     version,
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Shadow Agent', 'Chrome', '120.0.0'],
+    browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
     connectTimeoutMs: 60000,
-    qrTimeout: 60000,
+    defaultQueryTimeoutMs: 60000,
+    emitOwnEvents: false,
+    markOnlineOnConnect: false,
   });
 
-  // Handle QR code
+  // Handle connection events
   sock.ev.on('connection.update', async (update) => {
+    log(`Connection update: ${JSON.stringify(update)}`);
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log('QR code generated — visit /qr to scan');
+      log('New QR code generated');
       qrCodeData = qr;
       isReady = false;
     }
 
     if (connection === 'open') {
-      console.log('✅ WhatsApp connected!');
+      log('WhatsApp connected successfully!');
       isReady = true;
       qrCodeData = null;
-      sendTelegram('✅ *Shadow Agent — WhatsApp Connected*\n\nYour WhatsApp monitor is live. I\'ll ping you when messages need action.');
+      sendTelegram('*Shadow Agent — WhatsApp Connected*\n\nYour WhatsApp monitor is live.');
     }
 
     if (connection === 'close') {
       isReady = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const reason = DisconnectReason;
+      const errorMsg = lastDisconnect?.error?.message || 'unknown';
 
-      console.log(`WhatsApp disconnected. Status: ${statusCode}`);
+      log(`Disconnected. Status: ${statusCode}, Error: ${errorMsg}`);
 
-      if (statusCode === reason.loggedOut) {
-        // Session expired — clear and start fresh
-        console.log('Logged out — clearing session for fresh QR');
+      if (statusCode === DisconnectReason.loggedOut) {
+        log('Logged out — clearing session');
         if (fs.existsSync(AUTH_DIR)) {
           fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         }
-        sendTelegram('⚠️ *Shadow Agent — WhatsApp Logged Out*\n\nPlease scan the QR code again to reconnect.');
+        sendTelegram('*Shadow Agent — WhatsApp Logged Out*\n\nPlease scan the QR code again.');
         setTimeout(startWhatsApp, 3000);
+      } else if (statusCode === 515 || statusCode === 503) {
+        log('Server error from WhatsApp — waiting 30s before retry');
+        setTimeout(startWhatsApp, 30000);
       } else {
-        // Temporary disconnect — try reconnecting
-        console.log('Reconnecting in 5 seconds...');
+        log('Reconnecting in 5 seconds...');
         setTimeout(startWhatsApp, 5000);
       }
     }
   });
 
-  // Save credentials when updated
   sock.ev.on('creds.update', saveCreds);
 
   // Handle incoming messages
@@ -144,7 +166,6 @@ async function startWhatsApp() {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      // Skip status broadcasts, own messages, and protocol messages
       if (msg.key.remoteJid === 'status@broadcast') continue;
       if (msg.key.fromMe) continue;
       if (!msg.message) continue;
@@ -177,14 +198,12 @@ async function startWhatsApp() {
         timestamp: new Date((msg.messageTimestamp || 0) * 1000).toISOString()
       });
 
-      // Debounce — process after 30 seconds of no new messages
       if (batchTimer) clearTimeout(batchTimer);
       batchTimer = setTimeout(processBatch, 30000);
     }
   });
 }
 
-// Batch messages to avoid spamming Claude on every single message
 const messageBatch = [];
 let batchTimer = null;
 
@@ -195,7 +214,7 @@ async function processBatch() {
   messageBatch.length = 0;
   batchTimer = null;
 
-  console.log(`Processing batch of ${messages.length} messages`);
+  log(`Processing batch of ${messages.length} messages`);
 
   try {
     const messageText = messages.map(m => {
@@ -229,10 +248,10 @@ Only flag things that genuinely need a response or action: client questions, bus
     if (needsAction) {
       const summaryMatch = text.match(/SUMMARY:([\s\S]+)/);
       const summary = summaryMatch ? summaryMatch[1].trim() : 'Check WhatsApp for recent messages.';
-      await sendTelegram(`📱 *WhatsApp — Action Needed*\n\n${summary}`);
+      await sendTelegram(`*WhatsApp — Action Needed*\n\n${summary}`);
     }
   } catch (err) {
-    console.error('Error processing batch:', err.message);
+    log(`Error processing batch: ${err.message}`);
   }
 }
 
@@ -244,9 +263,9 @@ async function sendTelegram(message) {
       parse_mode: 'Markdown'
     });
   } catch (err) {
-    console.error('Telegram error:', err.message);
+    log(`Telegram error: ${err.message}`);
   }
 }
 
-console.log('Starting WhatsApp Shadow Agent (Baileys)...');
-startWhatsApp();
+log('Starting WhatsApp Shadow Agent (Baileys v6.7.21)...');
+startWhatsApp().catch(err => log(`Startup error: ${err.message}`));
