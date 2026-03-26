@@ -37,6 +37,9 @@ let sock = null;
 let myJid = null;
 let assistantGroupJid = null;
 
+// Track messages the bot sends so we don't reply to ourselves
+const recentBotMessages = new Set();
+
 // ─── Approval Storage ──────────────────────────────────
 function loadApprovals() {
   try {
@@ -278,7 +281,7 @@ async function sendApprovalRequest(approvalId, from, originalMsg, draftReply, is
     `*Draft:*\n${draftReply}\n\n` +
     `Reply *ok* to send | Type your version | *skip* to ignore`;
 
-  await sock.sendMessage(assistantGroupJid, { text });
+  await sendToAssistantGroup(text);
   log(`Sent approval request #${approvalId} to assistant group`);
 }
 
@@ -448,11 +451,11 @@ async function handleAssistantGroupMessage(body) {
   log(`Chat message from Jarrah: ${trimmed.substring(0, 80)}`);
   try {
     const reply = await chatWithAI(trimmed);
-    await sock.sendMessage(assistantGroupJid, { text: reply });
+    await sendToAssistantGroup(reply);
     log('Sent chat reply');
   } catch (err) {
     log(`Chat error: ${err.message}`);
-    await sock.sendMessage(assistantGroupJid, { text: 'Sorry, had a hiccup. Try again.' });
+    await sendToAssistantGroup('Sorry, had a hiccup. Try again.');
   }
 }
 
@@ -463,21 +466,29 @@ async function handleApprovalAction(approval, responseText) {
     resolveApproval(approval.id, 'approved', approval.draftReply);
     await sock.sendMessage(approval.fromJid, { text: approval.draftReply });
     await sleep(500);
-    await sock.sendMessage(assistantGroupJid, { text: `Sent #${approval.id} to ${approval.from}` });
+    await sendToAssistantGroup(`Sent #${approval.id} to ${approval.from}`);
     log(`Approval #${approval.id}: sent draft to ${approval.from}`);
 
   } else if (lower === 'skip' || lower === 'nah' || lower === "i'll handle it" || lower === 'ill handle it' || lower === 'ignore') {
     resolveApproval(approval.id, 'skipped', null);
-    await sock.sendMessage(assistantGroupJid, { text: `Skipped #${approval.id}` });
+    await sendToAssistantGroup(`Skipped #${approval.id}`);
     log(`Approval #${approval.id}: skipped`);
 
   } else {
     resolveApproval(approval.id, 'edited', responseText);
     await sock.sendMessage(approval.fromJid, { text: responseText });
     await sleep(500);
-    await sock.sendMessage(assistantGroupJid, { text: `Sent your version for #${approval.id} to ${approval.from}` });
+    await sendToAssistantGroup(`Sent your version for #${approval.id} to ${approval.from}`);
     log(`Approval #${approval.id}: sent Jarrah's edited version to ${approval.from}`);
   }
+}
+
+// ─── Send to Assistant Group (with tracking) ──────────
+async function sendToAssistantGroup(text) {
+  recentBotMessages.add(text);
+  // Auto-clean after 30 seconds
+  setTimeout(() => recentBotMessages.delete(text), 30000);
+  await sendToAssistantGroup(text);
 }
 
 // ─── Utilities ─────────────────────────────────────────
@@ -624,7 +635,8 @@ async function startWhatsApp() {
 
   // ─── Message Handler ───────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    // Accept both 'notify' (new incoming) and 'append' (own messages from other devices)
+    log(`messages.upsert: type=${type}, count=${messages.length}`);
 
     for (const msg of messages) {
       if (msg.key.remoteJid === 'status@broadcast') continue;
@@ -642,8 +654,19 @@ async function startWhatsApp() {
       const isGroup = msg.key.remoteJid.endsWith('@g.us');
       const isAssistantGroup = msg.key.remoteJid === assistantGroupJid;
 
+      log(`MSG: from=${msg.pushName || msg.key.remoteJid} fromMe=${isFromMe} group=${isGroup} assistantGroup=${isAssistantGroup} type=${type} body=${body.substring(0, 50)}`);
+
       // ── Jarrah's messages in the AI Assistant group ──
       if (isAssistantGroup && isFromMe) {
+        // Skip messages sent by the bot itself (prevent loops)
+        // Bot messages come through as 'append' with fromMe=true
+        // But Jarrah's messages from his phone also come as fromMe=true
+        // We detect bot messages by checking if we recently sent this exact text
+        if (recentBotMessages.has(body)) {
+          log('Skipping — this is our own bot message');
+          recentBotMessages.delete(body);
+          continue;
+        }
         try {
           await handleAssistantGroupMessage(body);
         } catch (err) {
@@ -677,9 +700,7 @@ async function startWhatsApp() {
           // AI is not confident — just flag it, no draft
           const source = isGroup ? `${from} (${groupName})` : from;
           if (assistantGroupJid) {
-            await sock.sendMessage(assistantGroupJid, {
-              text: `*Needs your attention*\n\nFrom: ${source}\n> ${body}\n\n_AI wasn't sure how to reply — handle this one yourself_`
-            });
+            await sendToAssistantGroup(`*Needs your attention*\n\nFrom: ${source}\n> ${body}\n\n_AI wasn't sure how to reply — handle this one yourself_`);
           }
           log(`Message from ${from}: flagged as NEEDS_JARRAH`);
         } else {
