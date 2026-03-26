@@ -7,30 +7,306 @@ const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
+// ─── Config ────────────────────────────────────────────
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const AUTH_DIR = '/data/baileys_auth';
+const APPROVALS_FILE = '/data/pending_approvals.json';
+const TRAINING_FILE = '/data/training_log.jsonl';
+const ASSISTANT_GROUP_FILE = '/data/assistant_group.json';
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const logger = pino({ level: 'warn' });
 
-// Capture logs so we can show them on /logs
+// ─── Logging ───────────────────────────────────────────
 const recentLogs = [];
 function log(msg) {
   const entry = `[${new Date().toISOString()}] ${msg}`;
   console.log(entry);
   recentLogs.push(entry);
-  if (recentLogs.length > 100) recentLogs.shift();
+  if (recentLogs.length > 200) recentLogs.shift();
 }
 
-// Use warn level so we can see Baileys connection errors
-const logger = pino({ level: 'warn' });
-
+// ─── State ─────────────────────────────────────────────
 let qrCodeData = null;
 let isReady = false;
 let sock = null;
+let myJid = null;
+let assistantGroupJid = null;
 
-// Simple HTTP server
+// ─── Approval Storage ──────────────────────────────────
+function loadApprovals() {
+  try {
+    if (fs.existsSync(APPROVALS_FILE)) return JSON.parse(fs.readFileSync(APPROVALS_FILE, 'utf8'));
+  } catch {}
+  return {};
+}
+
+function saveApprovals(data) {
+  fs.writeFileSync(APPROVALS_FILE, JSON.stringify(data, null, 2));
+}
+
+function nextApprovalId() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let id = '';
+  for (let i = 0; i < 3; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+}
+
+function createApproval(from, fromJid, originalMsg, draftReply, isGroup, groupName) {
+  const approvals = loadApprovals();
+  const id = nextApprovalId();
+  approvals[id] = {
+    id,
+    created: new Date().toISOString(),
+    from,
+    fromJid,
+    originalMsg,
+    draftReply,
+    isGroup,
+    groupName,
+    status: 'pending'
+  };
+  // Clean expired (older than 12 hours)
+  const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+  for (const [key, val] of Object.entries(approvals)) {
+    if (new Date(val.created).getTime() < cutoff) delete approvals[key];
+  }
+  saveApprovals(approvals);
+  return id;
+}
+
+function getLatestPending() {
+  const approvals = loadApprovals();
+  let latest = null;
+  for (const a of Object.values(approvals)) {
+    if (a.status === 'pending') {
+      if (!latest || new Date(a.created) > new Date(latest.created)) latest = a;
+    }
+  }
+  return latest;
+}
+
+function getPendingById(id) {
+  const approvals = loadApprovals();
+  return approvals[id] || null;
+}
+
+function resolveApproval(id, action, finalReply) {
+  const approvals = loadApprovals();
+  if (!approvals[id]) return null;
+  approvals[id].status = action;
+  approvals[id].finalReply = finalReply;
+  approvals[id].resolved = new Date().toISOString();
+  saveApprovals(approvals);
+  // Log training data
+  logTraining(approvals[id]);
+  return approvals[id];
+}
+
+function logTraining(approval) {
+  const entry = {
+    id: approval.id,
+    timestamp: new Date().toISOString(),
+    from: approval.from,
+    original: approval.originalMsg,
+    draft: approval.draftReply,
+    action: approval.status,
+    finalReply: approval.finalReply || null
+  };
+  fs.appendFileSync(TRAINING_FILE, JSON.stringify(entry) + '\n');
+}
+
+// ─── Training Examples ─────────────────────────────────
+function getTrainingExamples(maxExamples = 8) {
+  try {
+    if (!fs.existsSync(TRAINING_FILE)) return '';
+    const lines = fs.readFileSync(TRAINING_FILE, 'utf8').trim().split('\n').filter(Boolean);
+    if (lines.length === 0) return '';
+
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    // Prioritise edits (most valuable), then recent approvals
+    const edits = entries.filter(e => e.action === 'edited').slice(-5);
+    const approved = entries.filter(e => e.action === 'approved').slice(-5);
+    const examples = [...edits, ...approved].slice(-maxExamples);
+
+    if (examples.length === 0) return '';
+
+    let text = '\nHere are examples of how Jarrah actually replies:\n\n';
+    for (const ex of examples) {
+      text += `Message from ${ex.from}: "${ex.original}"\n`;
+      if (ex.action === 'edited') {
+        text += `AI draft: "${ex.draft}"\n`;
+        text += `Jarrah changed it to: "${ex.finalReply}"\n\n`;
+      } else {
+        text += `Jarrah approved this reply: "${ex.finalReply}"\n\n`;
+      }
+    }
+    return text;
+  } catch (err) {
+    log(`Error loading training examples: ${err.message}`);
+    return '';
+  }
+}
+
+// ─── Draft Generation ──────────────────────────────────
+async function draftReply(from, message, isGroup, groupName) {
+  const examples = getTrainingExamples();
+  const context = isGroup ? ` (in group: ${groupName})` : '';
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 300,
+    messages: [{
+      role: 'user',
+      content: `You are drafting WhatsApp replies on behalf of Jarrah Martin.
+
+Jarrah runs three businesses:
+- PEC (Performance Evolution Coaching) — fitness coaching for women 40-60
+- TSS (The Sovereign Standard) — helps fitness coaches scale to $50k/month+
+- APAW (Apex Property And Wealth) — strategic property ownership
+
+His WhatsApp messages are mostly from sales reps and team members.
+
+Jarrah's tone: direct, casual, strategic. Like a business partner. No fluff, no corporate speak. Short messages. Uses words like "cheers", "nice one", "no worries", "mate". Thinks in systems and outcomes.
+${examples}
+Now draft a reply to this message:
+From: ${from}${context}
+Message: ${message}
+
+Rules:
+- Keep it short (1-3 sentences max)
+- Match Jarrah's casual but direct tone
+- If the message is just an update with no question, a brief acknowledgement is fine
+- If it needs a decision you're not sure about, say NEEDS_JARRAH instead of guessing
+
+Reply with ONLY the draft text, nothing else.`
+    }]
+  });
+
+  return response.content[0].text.trim();
+}
+
+// ─── Assistant Group ───────────────────────────────────
+async function getOrCreateAssistantGroup() {
+  // Check if we already have a saved group JID
+  try {
+    if (fs.existsSync(ASSISTANT_GROUP_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ASSISTANT_GROUP_FILE, 'utf8'));
+      if (data.groupJid) {
+        // Verify group still exists
+        try {
+          await sock.groupMetadata(data.groupJid);
+          log(`Using existing assistant group: ${data.groupJid}`);
+          return data.groupJid;
+        } catch {
+          log('Saved assistant group no longer valid, creating new one');
+        }
+      }
+    }
+  } catch {}
+
+  // Create new group
+  log('Creating AI Assistant group...');
+  const group = await sock.groupCreate('AI Assistant', []);
+  const groupJid = group.id;
+  fs.writeFileSync(ASSISTANT_GROUP_FILE, JSON.stringify({ groupJid }));
+  log(`Created assistant group: ${groupJid}`);
+
+  // Send welcome message
+  await sleep(1000);
+  await sock.sendMessage(groupJid, {
+    text: `*AI Assistant is ready*\n\nI'll send you draft replies here for approval.\n\nReply *ok* to send a draft as-is\nReply *skip* to ignore\nOr type your own version to send that instead`
+  });
+
+  return groupJid;
+}
+
+// ─── Send Approval Request ─────────────────────────────
+async function sendApprovalRequest(approvalId, from, originalMsg, draftReply, isGroup, groupName) {
+  if (!assistantGroupJid) {
+    log('No assistant group — falling back to Telegram');
+    await sendTelegram(`*Draft Reply Needed*\n\nFrom: ${from}\nMessage: ${originalMsg}\n\nDraft: ${draftReply}\n\n(Approve in AI Assistant WhatsApp group)`);
+    return;
+  }
+
+  const source = isGroup ? `${from} (${groupName})` : from;
+
+  const text = `*#${approvalId}* | ${source}\n\n` +
+    `> ${originalMsg}\n\n` +
+    `*Draft:*\n${draftReply}\n\n` +
+    `Reply *ok* to send | Type your version | *skip* to ignore`;
+
+  await sock.sendMessage(assistantGroupJid, { text });
+  log(`Sent approval request #${approvalId} to assistant group`);
+}
+
+// ─── Handle Approval Response ──────────────────────────
+async function handleApprovalResponse(body) {
+  const trimmed = body.trim();
+
+  // Check if response targets a specific ID: "#ABC ok" or "#ABC some reply"
+  const idMatch = trimmed.match(/^#([A-Z0-9]{3})\s+([\s\S]+)/i);
+
+  let approval = null;
+  let responseText = trimmed;
+
+  if (idMatch) {
+    approval = getPendingById(idMatch[1].toUpperCase());
+    responseText = idMatch[2].trim();
+  } else {
+    approval = getLatestPending();
+  }
+
+  if (!approval) {
+    log('No pending approval found for response');
+    return;
+  }
+
+  const lower = responseText.toLowerCase();
+
+  if (lower === 'ok' || lower === 'yes' || lower === 'send' || lower === 'yep' || lower === 'approved') {
+    // Send draft as-is
+    const resolved = resolveApproval(approval.id, 'approved', approval.draftReply);
+    await sock.sendMessage(approval.fromJid, { text: approval.draftReply });
+    await sleep(500);
+    await sock.sendMessage(assistantGroupJid, { text: `Sent #${approval.id} to ${approval.from}` });
+    log(`Approval #${approval.id}: sent draft to ${approval.from}`);
+
+  } else if (lower === 'skip' || lower === 'nah' || lower === "i'll handle it" || lower === 'ill handle it' || lower === 'ignore') {
+    // Skip — Jarrah handles manually
+    resolveApproval(approval.id, 'skipped', null);
+    await sock.sendMessage(assistantGroupJid, { text: `Skipped #${approval.id}` });
+    log(`Approval #${approval.id}: skipped`);
+
+  } else {
+    // Jarrah typed his own version — send that instead
+    const resolved = resolveApproval(approval.id, 'edited', responseText);
+    await sock.sendMessage(approval.fromJid, { text: responseText });
+    await sleep(500);
+    await sock.sendMessage(assistantGroupJid, { text: `Sent your version for #${approval.id} to ${approval.from}` });
+    log(`Approval #${approval.id}: sent Jarrah's edited version to ${approval.from}`);
+  }
+}
+
+// ─── Utilities ─────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function sendTelegram(message) {
+  try {
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'Markdown'
+    });
+  } catch (err) {
+    log(`Telegram error: ${err.message}`);
+  }
+}
+
+// ─── HTTP Server ───────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   if (req.url === '/qr') {
     if (isReady) {
@@ -52,29 +328,24 @@ const server = http.createServer(async (req, res) => {
       `);
     } else {
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(`
-        <html>
-          <head><meta http-equiv="refresh" content="5"></head>
-          <body style="text-align:center;font-family:sans-serif;padding:40px">
-            <h1>Starting up...</h1><p>Please wait, refreshing automatically...</p>
-          </body>
-        </html>
-      `);
+      res.end('<html><head><meta http-equiv="refresh" content="5"></head><body style="text-align:center;font-family:sans-serif;padding:40px"><h1>Starting up...</h1></body></html>');
     }
   } else if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', connected: isReady }));
+    res.end(JSON.stringify({ status: 'ok', connected: isReady, assistantGroup: !!assistantGroupJid }));
   } else if (req.url === '/logs') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(recentLogs.join('\n') || 'No logs yet');
+  } else if (req.url === '/approvals') {
+    const approvals = loadApprovals();
+    const training = fs.existsSync(TRAINING_FILE) ? fs.readFileSync(TRAINING_FILE, 'utf8').trim().split('\n').length : 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ pending: approvals, trainingEntries: training }, null, 2));
   } else if (req.url === '/reset') {
-    // Clear session and restart
     try {
-      if (fs.existsSync(AUTH_DIR)) {
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      }
+      if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, message: 'Session cleared. Restarting...' }));
+      res.end(JSON.stringify({ ok: true }));
       setTimeout(() => process.exit(0), 500);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -87,22 +358,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000, () => {
-  log(`QR server running on port ${process.env.PORT || 3000}`);
+  log(`Server running on port ${process.env.PORT || 3000}`);
 });
 
-// WhatsApp connection using Baileys
+// ─── WhatsApp Connection ───────────────────────────────
 async function startWhatsApp() {
-  // Clear any old auth that might be corrupted
   if (fs.existsSync(AUTH_DIR)) {
     const files = fs.readdirSync(AUTH_DIR);
     log(`Auth dir has ${files.length} files`);
   }
-
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
-
   log(`Using WA version: ${version.join('.')}`);
 
   sock = makeWASocket({
@@ -113,11 +381,10 @@ async function startWhatsApp() {
     browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
-    emitOwnEvents: false,
+    emitOwnEvents: true,
     markOnlineOnConnect: false,
   });
 
-  // Handle connection events
   sock.ev.on('connection.update', async (update) => {
     log(`Connection update: ${JSON.stringify(update)}`);
     const { connection, lastDisconnect, qr } = update;
@@ -129,31 +396,36 @@ async function startWhatsApp() {
     }
 
     if (connection === 'open') {
-      log('WhatsApp connected successfully!');
+      log('WhatsApp connected!');
       isReady = true;
       qrCodeData = null;
-      sendTelegram('*Shadow Agent — WhatsApp Connected*\n\nYour WhatsApp monitor is live.');
+      myJid = sock.user?.id;
+      log(`My JID: ${myJid}`);
+
+      // Set up assistant group
+      try {
+        assistantGroupJid = await getOrCreateAssistantGroup();
+        log(`Assistant group ready: ${assistantGroupJid}`);
+      } catch (err) {
+        log(`Failed to set up assistant group: ${err.message}`);
+      }
+
+      sendTelegram('*Shadow Agent v2 — Connected*\n\nNow drafting replies for your approval.');
     }
 
     if (connection === 'close') {
       isReady = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const errorMsg = lastDisconnect?.error?.message || 'unknown';
-
-      log(`Disconnected. Status: ${statusCode}, Error: ${errorMsg}`);
+      log(`Disconnected. Status: ${statusCode}`);
 
       if (statusCode === DisconnectReason.loggedOut) {
         log('Logged out — clearing session');
-        if (fs.existsSync(AUTH_DIR)) {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        }
-        sendTelegram('*Shadow Agent — WhatsApp Logged Out*\n\nPlease scan the QR code again.');
+        if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        sendTelegram('*Shadow Agent — Logged Out*\n\nPlease scan QR again.');
         setTimeout(startWhatsApp, 3000);
       } else if (statusCode === 515 || statusCode === 503) {
-        log('Server error from WhatsApp — waiting 30s before retry');
         setTimeout(startWhatsApp, 30000);
       } else {
-        log('Reconnecting in 5 seconds...');
         setTimeout(startWhatsApp, 5000);
       }
     }
@@ -161,13 +433,12 @@ async function startWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Handle incoming messages
+  // ─── Message Handler ───────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
       if (msg.key.remoteJid === 'status@broadcast') continue;
-      if (msg.key.fromMe) continue;
       if (!msg.message) continue;
 
       const body = msg.message.conversation
@@ -178,7 +449,25 @@ async function startWhatsApp() {
 
       if (!body) continue;
 
+      const isFromMe = msg.key.fromMe;
       const isGroup = msg.key.remoteJid.endsWith('@g.us');
+      const isAssistantGroup = msg.key.remoteJid === assistantGroupJid;
+
+      // ── Jarrah's replies in the AI Assistant group ──
+      if (isAssistantGroup && isFromMe) {
+        try {
+          await handleApprovalResponse(body);
+        } catch (err) {
+          log(`Error handling approval: ${err.message}`);
+        }
+        continue;
+      }
+
+      // Skip own messages and assistant group messages
+      if (isFromMe) continue;
+      if (isAssistantGroup) continue;
+
+      // ── Incoming message from someone else ──
       const from = msg.pushName || msg.key.participant || msg.key.remoteJid;
 
       let groupName = null;
@@ -189,83 +478,35 @@ async function startWhatsApp() {
         } catch { groupName = 'Unknown Group'; }
       }
 
-      messageBatch.push({
-        from,
-        number: msg.key.remoteJid,
-        body,
-        isGroup,
-        groupName,
-        timestamp: new Date((msg.messageTimestamp || 0) * 1000).toISOString()
-      });
+      log(`Message from ${from}${isGroup ? ` (${groupName})` : ''}: ${body.substring(0, 80)}`);
 
-      if (batchTimer) clearTimeout(batchTimer);
-      batchTimer = setTimeout(processBatch, 30000);
+      // Draft a reply and send for approval
+      try {
+        const draft = await draftReply(from, body, isGroup, groupName);
+
+        if (draft === 'NEEDS_JARRAH' || draft.includes('NEEDS_JARRAH')) {
+          // AI is not confident — just flag it, no draft
+          const source = isGroup ? `${from} (${groupName})` : from;
+          if (assistantGroupJid) {
+            await sock.sendMessage(assistantGroupJid, {
+              text: `*Needs your attention*\n\nFrom: ${source}\n> ${body}\n\n_AI wasn't sure how to reply — handle this one yourself_`
+            });
+          }
+          log(`Message from ${from}: flagged as NEEDS_JARRAH`);
+        } else {
+          // Create approval and send to assistant group
+          const approvalId = createApproval(from, msg.key.remoteJid, body, draft, isGroup, groupName);
+          await sleep(1000);
+          await sendApprovalRequest(approvalId, from, body, draft, isGroup, groupName);
+        }
+      } catch (err) {
+        log(`Error drafting reply for ${from}: ${err.message}`);
+        // Fall back to simple notification
+        await sendTelegram(`*WhatsApp message from ${from}*\n\n${body.substring(0, 200)}`);
+      }
     }
   });
 }
 
-const messageBatch = [];
-let batchTimer = null;
-
-async function processBatch() {
-  if (messageBatch.length === 0) return;
-
-  const messages = [...messageBatch];
-  messageBatch.length = 0;
-  batchTimer = null;
-
-  log(`Processing batch of ${messages.length} messages`);
-
-  try {
-    const messageText = messages.map(m => {
-      const source = m.isGroup ? `[Group: ${m.groupName}] ${m.from}` : m.from;
-      return `FROM: ${source}\nMESSAGE: ${m.body}\nTIME: ${m.timestamp}`;
-    }).join('\n\n---\n\n');
-
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 500,
-      messages: [{
-        role: 'user',
-        content: `You are a shadow agent monitoring WhatsApp messages for Jarrah Martin, a fitness business owner (PEC, TSS, APAW).
-
-Review these recent WhatsApp messages and decide if any need action.
-
-MESSAGES:
-${messageText}
-
-Respond in this exact format:
-ACTION_NEEDED: yes/no
-SUMMARY: (if yes, 2-3 bullet points of what needs action and from who — be specific and brief)
-
-Only flag things that genuinely need a response or action: client questions, business enquiries, urgent matters, bookings, payments, complaints. Ignore casual chit-chat, spam, and automated messages.`
-      }]
-    });
-
-    const text = response.content[0].text;
-    const needsAction = text.includes('ACTION_NEEDED: yes');
-
-    if (needsAction) {
-      const summaryMatch = text.match(/SUMMARY:([\s\S]+)/);
-      const summary = summaryMatch ? summaryMatch[1].trim() : 'Check WhatsApp for recent messages.';
-      await sendTelegram(`*WhatsApp — Action Needed*\n\n${summary}`);
-    }
-  } catch (err) {
-    log(`Error processing batch: ${err.message}`);
-  }
-}
-
-async function sendTelegram(message) {
-  try {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: 'Markdown'
-    });
-  } catch (err) {
-    log(`Telegram error: ${err.message}`);
-  }
-}
-
-log('Starting WhatsApp Shadow Agent (Baileys v6.7.21)...');
+log('Starting WhatsApp Shadow Agent v2 (with approval flow)...');
 startWhatsApp().catch(err => log(`Startup error: ${err.message}`));
