@@ -653,11 +653,14 @@ async function startWhatsApp() {
       const isFromMe = msg.key.fromMe;
       const isGroup = msg.key.remoteJid.endsWith('@g.us');
       const isAssistantGroup = msg.key.remoteJid === assistantGroupJid;
+      // In groups, check participant JID to see if it's Jarrah
+      const participantJid = msg.key.participant || '';
+      const isFromJarrah = isFromMe || (myJid && participantJid.includes(myJid.split(':')[0]));
 
-      log(`MSG: from=${msg.pushName || msg.key.remoteJid} fromMe=${isFromMe} group=${isGroup} assistantGroup=${isAssistantGroup} type=${type} body=${body.substring(0, 50)}`);
+      log(`MSG: from=${msg.pushName || msg.key.remoteJid} fromMe=${isFromMe} fromJarrah=${isFromJarrah} group=${isGroup} assistantGroup=${isAssistantGroup} participant=${participantJid} body=${body.substring(0, 50)}`);
 
       // ── Jarrah's messages in the AI Assistant group ──
-      if (isAssistantGroup && isFromMe) {
+      if (isAssistantGroup && isFromJarrah) {
         // Skip messages sent by the bot itself (prevent loops)
         // Bot messages come through as 'append' with fromMe=true
         // But Jarrah's messages from his phone also come as fromMe=true
