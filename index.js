@@ -15,6 +15,8 @@ const AUTH_DIR = '/data/baileys_auth';
 const APPROVALS_FILE = '/data/pending_approvals.json';
 const TRAINING_FILE = '/data/training_log.jsonl';
 const ASSISTANT_GROUP_FILE = '/data/assistant_group.json';
+const RULES_FILE = '/data/reply_rules.json';
+const IDEAS_FILE = '/data/automation_ideas.jsonl';
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const logger = pino({ level: 'warn' });
@@ -118,6 +120,40 @@ function logTraining(approval) {
   fs.appendFileSync(TRAINING_FILE, JSON.stringify(entry) + '\n');
 }
 
+// ─── Reply Rules (Jarrah's instructions) ───────────────
+function loadRules() {
+  try {
+    if (fs.existsSync(RULES_FILE)) return JSON.parse(fs.readFileSync(RULES_FILE, 'utf8'));
+  } catch {}
+  return [];
+}
+
+function saveRules(rules) {
+  fs.writeFileSync(RULES_FILE, JSON.stringify(rules, null, 2));
+}
+
+function addRule(rule) {
+  const rules = loadRules();
+  rules.push({ rule, added: new Date().toISOString() });
+  saveRules(rules);
+  return rules.length;
+}
+
+function getRulesText() {
+  const rules = loadRules();
+  if (rules.length === 0) return '';
+  let text = '\n\nJarrah has given you these specific instructions for how to handle messages:\n';
+  for (let i = 0; i < rules.length; i++) {
+    text += `${i + 1}. ${rules[i].rule}\n`;
+  }
+  return text;
+}
+
+function logIdea(idea) {
+  const entry = { idea, timestamp: new Date().toISOString() };
+  fs.appendFileSync(IDEAS_FILE, JSON.stringify(entry) + '\n');
+}
+
 // ─── Training Examples ─────────────────────────────────
 function getTrainingExamples(maxExamples = 8) {
   try {
@@ -154,6 +190,7 @@ function getTrainingExamples(maxExamples = 8) {
 // ─── Draft Generation ──────────────────────────────────
 async function draftReply(from, message, isGroup, groupName) {
   const examples = getTrainingExamples();
+  const rules = getRulesText();
   const context = isGroup ? ` (in group: ${groupName})` : '';
 
   const response = await anthropic.messages.create({
@@ -171,6 +208,7 @@ Jarrah runs three businesses:
 His WhatsApp messages are mostly from sales reps and team members.
 
 Jarrah's tone: direct, casual, strategic. Like a business partner. No fluff, no corporate speak. Short messages. Uses words like "cheers", "nice one", "no worries", "mate". Thinks in systems and outcomes.
+${rules}
 ${examples}
 Now draft a reply to this message:
 From: ${from}${context}
@@ -181,6 +219,7 @@ Rules:
 - Match Jarrah's casual but direct tone
 - If the message is just an update with no question, a brief acknowledgement is fine
 - If it needs a decision you're not sure about, say NEEDS_JARRAH instead of guessing
+- ALWAYS follow Jarrah's specific instructions above if they apply to this situation
 
 Reply with ONLY the draft text, nothing else.`
     }]
@@ -268,6 +307,14 @@ async function chatWithAI(message) {
   // Add Jarrah's message
   history.push({ role: 'user', content: message });
 
+  // Load current rules and training stats for context
+  const currentRules = loadRules();
+  const rulesContext = currentRules.length > 0
+    ? `\n\nCurrent reply rules you have saved:\n${currentRules.map((r, i) => `${i + 1}. ${r.rule}`).join('\n')}`
+    : '\n\nNo reply rules saved yet.';
+
+  const trainingCount = fs.existsSync(TRAINING_FILE) ? fs.readFileSync(TRAINING_FILE, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-5-20250514',
     max_tokens: 1000,
@@ -283,22 +330,78 @@ Key context:
 - His team includes sales reps, VAs, coaches
 - He uses Go High Level, Stripe, Google Sheets, Notion, Slack, Xero, Instagram, Facebook
 - He's based in Australia
+- Training data: ${trainingCount} approved/edited replies so far
+${rulesContext}
 
-Communication style: Direct, strategic, like a business partner. Keep it casual but smart. No fluff. Short messages — this is WhatsApp, not email. Use plain language.
+== YOUR CAPABILITIES ==
 
-You can help with:
-- Business strategy, planning, decisions
-- Drafting messages, emails, content
-- Analysing ideas, offers, pricing
-- Research and competitor analysis
-- Task planning and prioritisation
-- Anything else he asks
+1. REPLY RULES — Jarrah can teach you how to handle specific situations. When he gives you an instruction like "when someone says X, reply with Y" or "always ask why when a client cancels", save it as a rule.
 
-If you don't know something specific about his business, ask him rather than guessing.`,
-    messages: history.slice(-20) // Send last 20 messages for context
+To save a rule, include this exact tag in your reply:
+[SAVE_RULE: the rule text here]
+
+To delete a rule, include:
+[DELETE_RULE: rule number]
+
+To list all rules, include:
+[LIST_RULES]
+
+2. AUTOMATION IDEAS — When Jarrah talks about wanting to automate something, save the idea so we can build it later.
+
+To save an idea, include:
+[SAVE_IDEA: the idea description]
+
+3. GENERAL CHAT — Strategy, planning, drafting, brainstorming, anything else.
+
+== STYLE ==
+Direct, strategic, like a business partner. Keep it casual but smart. No fluff. Short messages — this is WhatsApp, not email. Use plain language. Use bullet points for lists.
+
+When Jarrah teaches you something about how to reply, confirm it clearly and save the rule. Be proactive — if you spot patterns in what he's teaching you, suggest additional rules.`,
+    messages: history.slice(-20)
   });
 
-  const reply = response.content[0].text;
+  let reply = response.content[0].text;
+
+  // Process action tags before sending
+  // Save rules
+  const ruleMatches = reply.matchAll(/\[SAVE_RULE:\s*(.+?)\]/g);
+  for (const match of ruleMatches) {
+    const count = addRule(match[1].trim());
+    log(`Saved rule #${count}: ${match[1].trim()}`);
+  }
+  reply = reply.replace(/\[SAVE_RULE:\s*.+?\]/g, '').trim();
+
+  // Delete rules
+  const deleteMatches = reply.matchAll(/\[DELETE_RULE:\s*(\d+)\]/g);
+  for (const match of deleteMatches) {
+    const rules = loadRules();
+    const idx = parseInt(match[1]) - 1;
+    if (idx >= 0 && idx < rules.length) {
+      const removed = rules.splice(idx, 1);
+      saveRules(rules);
+      log(`Deleted rule: ${removed[0].rule}`);
+    }
+  }
+  reply = reply.replace(/\[DELETE_RULE:\s*\d+\]/g, '').trim();
+
+  // List rules
+  if (reply.includes('[LIST_RULES]')) {
+    const rules = loadRules();
+    if (rules.length > 0) {
+      const list = rules.map((r, i) => `${i + 1}. ${r.rule}`).join('\n');
+      reply = reply.replace('[LIST_RULES]', `*Your current rules:*\n${list}`);
+    } else {
+      reply = reply.replace('[LIST_RULES]', 'No rules saved yet. Teach me by telling me how to handle specific situations.');
+    }
+  }
+
+  // Save ideas
+  const ideaMatches = reply.matchAll(/\[SAVE_IDEA:\s*(.+?)\]/g);
+  for (const match of ideaMatches) {
+    logIdea(match[1].trim());
+    log(`Saved automation idea: ${match[1].trim()}`);
+  }
+  reply = reply.replace(/\[SAVE_IDEA:\s*.+?\]/g, '').trim();
 
   // Add AI response to history
   history.push({ role: 'assistant', content: reply });
