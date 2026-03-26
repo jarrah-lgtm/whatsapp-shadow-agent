@@ -243,47 +243,133 @@ async function sendApprovalRequest(approvalId, from, originalMsg, draftReply, is
   log(`Sent approval request #${approvalId} to assistant group`);
 }
 
-// ─── Handle Approval Response ──────────────────────────
-async function handleApprovalResponse(body) {
+// ─── Chat Conversation ─────────────────────────────────
+const CHAT_HISTORY_FILE = '/data/chat_history.json';
+
+function loadChatHistory() {
+  try {
+    if (fs.existsSync(CHAT_HISTORY_FILE)) {
+      const history = JSON.parse(fs.readFileSync(CHAT_HISTORY_FILE, 'utf8'));
+      // Keep last 20 messages for context
+      return history.slice(-20);
+    }
+  } catch {}
+  return [];
+}
+
+function saveChatHistory(history) {
+  // Only keep last 50 messages on disk
+  fs.writeFileSync(CHAT_HISTORY_FILE, JSON.stringify(history.slice(-50), null, 2));
+}
+
+async function chatWithAI(message) {
+  const history = loadChatHistory();
+
+  // Add Jarrah's message
+  history.push({ role: 'user', content: message });
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5-20250514',
+    max_tokens: 1000,
+    system: `You are Jarrah Martin's AI business assistant on WhatsApp.
+
+Jarrah runs three businesses:
+- PEC (Performance Evolution Coaching) — fitness coaching for women 40-60, helps them lose fat sustainably
+- TSS (The Sovereign Standard) — helps fitness coaches stuck at $10-20k/month scale to $50k/month+ by shifting from freelancer to entrepreneur. This is his main focus.
+- APAW (Apex Property And Wealth) — helps people build long-term financial safety through strategic property ownership
+
+Key context:
+- PEC is also his proving ground — he systemises it so he can hand the blueprint to TSS clients
+- His team includes sales reps, VAs, coaches
+- He uses Go High Level, Stripe, Google Sheets, Notion, Slack, Xero, Instagram, Facebook
+- He's based in Australia
+
+Communication style: Direct, strategic, like a business partner. Keep it casual but smart. No fluff. Short messages — this is WhatsApp, not email. Use plain language.
+
+You can help with:
+- Business strategy, planning, decisions
+- Drafting messages, emails, content
+- Analysing ideas, offers, pricing
+- Research and competitor analysis
+- Task planning and prioritisation
+- Anything else he asks
+
+If you don't know something specific about his business, ask him rather than guessing.`,
+    messages: history.slice(-20) // Send last 20 messages for context
+  });
+
+  const reply = response.content[0].text;
+
+  // Add AI response to history
+  history.push({ role: 'assistant', content: reply });
+  saveChatHistory(history);
+
+  return reply;
+}
+
+// ─── Handle Messages in Assistant Group ────────────────
+async function handleAssistantGroupMessage(body) {
   const trimmed = body.trim();
+  const lower = trimmed.toLowerCase();
 
-  // Check if response targets a specific ID: "#ABC ok" or "#ABC some reply"
+  // Check if it targets a specific approval by ID
   const idMatch = trimmed.match(/^#([A-Z0-9]{3})\s+([\s\S]+)/i);
-
-  let approval = null;
-  let responseText = trimmed;
-
   if (idMatch) {
-    approval = getPendingById(idMatch[1].toUpperCase());
-    responseText = idMatch[2].trim();
-  } else {
-    approval = getLatestPending();
+    const approval = getPendingById(idMatch[1].toUpperCase());
+    if (approval) {
+      await handleApprovalAction(approval, idMatch[2].trim());
+      return;
+    }
   }
 
-  if (!approval) {
-    log('No pending approval found for response');
+  // Check if there's a pending approval and this is a quick action
+  const pending = getLatestPending();
+  const isApprovalAction = pending && (
+    lower === 'ok' || lower === 'yes' || lower === 'send' || lower === 'yep' || lower === 'approved' ||
+    lower === 'skip' || lower === 'nah' || lower === "i'll handle it" || lower === 'ill handle it' || lower === 'ignore'
+  );
+
+  if (isApprovalAction) {
+    await handleApprovalAction(pending, trimmed);
     return;
   }
 
+  // If there's a pending approval and the message doesn't look like a chat question,
+  // treat it as an edited reply
+  if (pending && !trimmed.endsWith('?') && !lower.startsWith('hey') && !lower.startsWith('can you') && !lower.startsWith('what') && !lower.startsWith('how') && !lower.startsWith('why') && !lower.startsWith('when') && !lower.startsWith('where') && !lower.startsWith('who') && !lower.startsWith('do you') && !lower.startsWith('tell me') && !lower.startsWith('help') && trimmed.length < 200) {
+    await handleApprovalAction(pending, trimmed);
+    return;
+  }
+
+  // Otherwise — it's a chat message for the AI
+  log(`Chat message from Jarrah: ${trimmed.substring(0, 80)}`);
+  try {
+    const reply = await chatWithAI(trimmed);
+    await sock.sendMessage(assistantGroupJid, { text: reply });
+    log('Sent chat reply');
+  } catch (err) {
+    log(`Chat error: ${err.message}`);
+    await sock.sendMessage(assistantGroupJid, { text: 'Sorry, had a hiccup. Try again.' });
+  }
+}
+
+async function handleApprovalAction(approval, responseText) {
   const lower = responseText.toLowerCase();
 
   if (lower === 'ok' || lower === 'yes' || lower === 'send' || lower === 'yep' || lower === 'approved') {
-    // Send draft as-is
-    const resolved = resolveApproval(approval.id, 'approved', approval.draftReply);
+    resolveApproval(approval.id, 'approved', approval.draftReply);
     await sock.sendMessage(approval.fromJid, { text: approval.draftReply });
     await sleep(500);
     await sock.sendMessage(assistantGroupJid, { text: `Sent #${approval.id} to ${approval.from}` });
     log(`Approval #${approval.id}: sent draft to ${approval.from}`);
 
   } else if (lower === 'skip' || lower === 'nah' || lower === "i'll handle it" || lower === 'ill handle it' || lower === 'ignore') {
-    // Skip — Jarrah handles manually
     resolveApproval(approval.id, 'skipped', null);
     await sock.sendMessage(assistantGroupJid, { text: `Skipped #${approval.id}` });
     log(`Approval #${approval.id}: skipped`);
 
   } else {
-    // Jarrah typed his own version — send that instead
-    const resolved = resolveApproval(approval.id, 'edited', responseText);
+    resolveApproval(approval.id, 'edited', responseText);
     await sock.sendMessage(approval.fromJid, { text: responseText });
     await sleep(500);
     await sock.sendMessage(assistantGroupJid, { text: `Sent your version for #${approval.id} to ${approval.from}` });
@@ -453,12 +539,12 @@ async function startWhatsApp() {
       const isGroup = msg.key.remoteJid.endsWith('@g.us');
       const isAssistantGroup = msg.key.remoteJid === assistantGroupJid;
 
-      // ── Jarrah's replies in the AI Assistant group ──
+      // ── Jarrah's messages in the AI Assistant group ──
       if (isAssistantGroup && isFromMe) {
         try {
-          await handleApprovalResponse(body);
+          await handleAssistantGroupMessage(body);
         } catch (err) {
-          log(`Error handling approval: ${err.message}`);
+          log(`Error handling assistant group message: ${err.message}`);
         }
         continue;
       }
