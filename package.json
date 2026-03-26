@@ -10,7 +10,6 @@
     "@whiskeysockets/baileys": "6.7.21",
     "qrcode": "^1.5.3",
     "axios": "^1.6.0",
-    "@anthropic-ai/sdk": "^0.80.0",
     "pino": "^9.0.0"
   },
   "engines": {

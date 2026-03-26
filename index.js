@@ -1,7 +1,7 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const axios = require('axios');
-const Anthropic = require('@anthropic-ai/sdk');
+// Using direct API calls via axios instead of SDK
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -18,7 +18,20 @@ const ASSISTANT_GROUP_FILE = '/data/assistant_group.json';
 const RULES_FILE = '/data/reply_rules.json';
 const IDEAS_FILE = '/data/automation_ideas.jsonl';
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+// Use direct API calls instead of SDK to avoid stack overflow issues
+async function callClaude(model, maxTokens, systemPrompt, messages) {
+  const payload = { model, max_tokens: maxTokens, messages };
+  if (systemPrompt) payload.system = systemPrompt;
+  const resp = await axios.post('https://api.anthropic.com/v1/messages', payload, {
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    timeout: 30000
+  });
+  return resp.data.content[0].text;
+}
 const logger = pino({ level: 'warn' });
 
 // ─── Logging ───────────────────────────────────────────
@@ -196,12 +209,7 @@ async function draftReply(from, message, isGroup, groupName) {
   const rules = getRulesText();
   const context = isGroup ? ` (in group: ${groupName})` : '';
 
-  const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 300,
-    messages: [{
-      role: 'user',
-      content: `You are drafting WhatsApp replies on behalf of Jarrah Martin.
+  const prompt = `You are drafting WhatsApp replies on behalf of Jarrah Martin.
 
 Jarrah runs three businesses:
 - PEC (Performance Evolution Coaching) — fitness coaching for women 40-60
@@ -210,7 +218,7 @@ Jarrah runs three businesses:
 
 His WhatsApp messages are mostly from sales reps and team members.
 
-Jarrah's tone: direct, casual, strategic. Like a business partner. No fluff, no corporate speak. Short messages. Uses words like "cheers", "nice one", "no worries", "mate". Thinks in systems and outcomes.
+Jarrah's tone: direct, casual, strategic. Like a business partner. No fluff, no corporate speak. Short messages. Uses words like "cheers", "nice one", "no worries", "legend". Thinks in systems and outcomes.
 ${rules}
 ${examples}
 Now draft a reply to this message:
@@ -224,11 +232,10 @@ Rules:
 - If it needs a decision you're not sure about, say NEEDS_JARRAH instead of guessing
 - ALWAYS follow Jarrah's specific instructions above if they apply to this situation
 
-Reply with ONLY the draft text, nothing else.`
-    }]
-  });
+Reply with ONLY the draft text, nothing else.`;
 
-  return response.content[0].text.trim();
+  const reply = await callClaude('claude-haiku-4-5-20251001', 300, null, [{ role: 'user', content: prompt }]);
+  return reply.trim();
 }
 
 // ─── Assistant Group ───────────────────────────────────
@@ -318,10 +325,7 @@ async function chatWithAI(message) {
 
   const trainingCount = fs.existsSync(TRAINING_FILE) ? fs.readFileSync(TRAINING_FILE, 'utf8').trim().split('\n').filter(Boolean).length : 0;
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-5-20250514',
-    max_tokens: 1000,
-    system: `You are Jarrah Martin's AI business assistant on WhatsApp.
+  const systemPrompt = `You are Jarrah Martin's AI business assistant on WhatsApp.
 
 Jarrah runs three businesses:
 - PEC (Performance Evolution Coaching) — fitness coaching for women 40-60, helps them lose fat sustainably
@@ -359,11 +363,11 @@ To save an idea, include:
 == STYLE ==
 Direct, strategic, like a business partner. Keep it casual but smart. No fluff. Short messages — this is WhatsApp, not email. Use plain language. Use bullet points for lists.
 
-When Jarrah teaches you something about how to reply, confirm it clearly and save the rule. Be proactive — if you spot patterns in what he's teaching you, suggest additional rules.`,
-    messages: history.slice(-20)
-  });
+When Jarrah teaches you something about how to reply, confirm it clearly and save the rule. Be proactive — if you spot patterns in what he's teaching you, suggest additional rules.`;
 
-  let reply = response.content[0].text;
+  const response = { content: [{ text: await callClaude('claude-sonnet-4-5-20250514', 1000, systemPrompt, history.slice(-20)) }] };
+
+  let reply = response.content[0].text.trim();
 
   // Process action tags before sending
   // Save rules
@@ -654,8 +658,10 @@ async function startWhatsApp() {
       const isGroup = msg.key.remoteJid.endsWith('@g.us');
       const isAssistantGroup = msg.key.remoteJid === assistantGroupJid;
       // In groups, check participant JID to see if it's Jarrah
+      // Jarrah's participant ID in groups may be a LID format (different from phone JID)
       const participantJid = msg.key.participant || '';
-      const isFromJarrah = isFromMe || (myJid && participantJid.includes(myJid.split(':')[0]));
+      const jarrahLid = '163543848620051@lid';
+      const isFromJarrah = isFromMe || participantJid === jarrahLid || (myJid && participantJid.includes(myJid.split(':')[0]));
 
       log(`MSG: from=${msg.pushName || msg.key.remoteJid} fromMe=${isFromMe} fromJarrah=${isFromJarrah} group=${isGroup} assistantGroup=${isAssistantGroup} participant=${participantJid} body=${body.substring(0, 50)}`);
 
