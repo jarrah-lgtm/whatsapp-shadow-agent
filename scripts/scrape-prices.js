@@ -8,6 +8,7 @@ const BASE = (process.argv[2] || 'https://peptidesolutions.au').replace(/\/+$/, 
 const OUT = process.argv[3] || `prices-${new URL(BASE).host}-${new Date().toISOString().slice(0, 10)}.csv`;
 const UA = 'Mozilla/5.0 (price-check script)';
 const MAX_PAGES = 100;
+const failures = [];
 
 async function getJson(url) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -16,8 +17,14 @@ async function getJson(url) {
       await new Promise(r => setTimeout(r, 2000 * attempt));
       continue;
     }
-    if (!res.ok) return null;
-    if (!(res.headers.get('content-type') || '').includes('json')) return null;
+    if (!res.ok) {
+      failures.push(`${url} -> HTTP ${res.status}`);
+      return null;
+    }
+    if (!(res.headers.get('content-type') || '').includes('json')) {
+      failures.push(`${url} -> not JSON (${res.headers.get('content-type')})`);
+      return null;
+    }
     return res.json();
   }
   throw new Error(`Gave up on ${url} after 3 attempts`);
@@ -82,6 +89,8 @@ const csvCell = v => {
   const rows = (await scrapeShopify()) ?? (await scrapeWoo());
   if (!rows) {
     console.error(`No Shopify or WooCommerce product feed found at ${BASE}`);
+    for (const f of failures) console.error(`  ${f}`);
+    if (failures.some(f => / (401|403)$/.test(f))) console.error('  403/401 means blocked (site firewall or network proxy), not a missing feed.');
     process.exit(1);
   }
   if (rows.length === 0) {
